@@ -1,0 +1,679 @@
+"use client"
+
+import { createContext, useContext, useEffect, useState, ReactNode, Suspense } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  GoogleAuthProvider,
+  signOut,
+  onAuthStateChanged,
+  browserSessionPersistence,
+  setPersistence,
+  updateProfile as updateFirebaseProfile,
+  updatePassword as updateFirebasePassword,
+  sendPasswordResetEmail,
+  updateEmail as updateFirebaseEmail,
+  User as FirebaseUser
+} from "firebase/auth";
+import { auth } from "@/lib/firebase";
+import { v4 as uuidv4 } from "uuid";
+import { sendEmail, EmailTemplate } from "@/lib/email-service-client"; // Updated import
+import { doc, getDoc, setDoc, updateDoc } from "firebase/firestore";
+import { db } from "@/lib/firebase"; // Assuming you have a Firestore db export
+import { logger } from "@/lib/logger";
+
+// Define anonymous trial settings
+const MAX_TRIAL_CONVERSATIONS = 10;
+const ANONYMOUS_ID_KEY = "pocketlawyer_anonymous_id";
+const TRIAL_CONVERSATIONS_KEY = "pocketlawyer_trial_conversations";
+
+// Email preferences interface
+export interface EmailPreferences {
+  systemUpdates: boolean;
+  chatSummaries: boolean;
+  trialNotifications: boolean;
+  marketingEmails: boolean;
+}
+
+// Default email preferences
+const DEFAULT_EMAIL_PREFERENCES: EmailPreferences = {
+  systemUpdates: true,
+  chatSummaries: true,
+  trialNotifications: true,
+  marketingEmails: false,
+};
+
+interface User {
+  id: string;
+  email: string | null;
+  name: string | null;
+  profileImage?: string | null;
+  provider: "email" | "google" | "anonymous";
+  isAnonymous?: boolean;
+  trialConversationsUsed?: number;
+  trialConversationsLimit?: number;
+  emailPreferences?: EmailPreferences;
+}
+
+interface AuthContextType {
+  user: User | null;
+  loading: boolean;
+  signIn: (email: string, password: string) => Promise<void>;
+  signUp: (email: string, password: string, name?: string) => Promise<void>;
+  signInWithGoogle: () => Promise<void>;
+  signOut: () => Promise<void>;
+  resetPassword: (email: string) => Promise<void>;
+  updateProfile: (data: { name?: string; email?: string; photoURL?: string }) => Promise<void>;
+  updatePassword: (currentPassword: string, newPassword: string) => Promise<void>;
+  incrementTrialConversations: () => number;
+  isTrialLimitReached: () => boolean;
+  getTrialConversationsRemaining: () => number;
+  clearAnonymousSession: () => void;
+  updateEmailPreferences: (preferences: Partial<EmailPreferences>) => Promise<void>;
+  sendEmailNotification: (template: EmailTemplate, data?: Record<string, any>) => Promise<boolean>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+// Create a separate component to use the searchParams
+function AuthProviderContent({ children }: { children: ReactNode }) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [initialAuthChecked, setInitialAuthChecked] = useState(false);
+
+  // Initialize or retrieve anonymous session
+  const initAnonymousSession = () => {
+    // Check for existing anonymous ID
+    let anonymousId = localStorage.getItem(ANONYMOUS_ID_KEY) || uuidv4();
+    localStorage.setItem(ANONYMOUS_ID_KEY, anonymousId);
+    localStorage.setItem(TRIAL_CONVERSATIONS_KEY, "0");
+    
+    const trialConversationsUsed = parseInt(localStorage.getItem(TRIAL_CONVERSATIONS_KEY) || "0", 10);
+    
+    return {
+      id: anonymousId,
+      email: null,
+      name: "Guest User",
+      provider: "anonymous" as const,
+      isAnonymous: true,
+      trialConversationsUsed,
+      trialConversationsLimit: MAX_TRIAL_CONVERSATIONS
+    } as const;
+  };
+  
+  // Increment conversation count for anonymous users
+  const incrementTrialConversations = (): number => {
+    if (!user?.isAnonymous) return 0;
+    
+    const currentCount = parseInt(localStorage.getItem(TRIAL_CONVERSATIONS_KEY) || "0", 10);
+    const newCount = currentCount + 1;
+    localStorage.setItem(TRIAL_CONVERSATIONS_KEY, newCount.toString());
+    
+    // Update user state
+    setUser(prev => {
+      if (prev && prev.isAnonymous) {
+        return {
+          ...prev,
+          trialConversationsUsed: newCount
+        };
+      }
+      return prev;
+    });
+    
+    return newCount;
+  };
+  
+  // Check if trial limit is reached
+  const isTrialLimitReached = (): boolean => {
+    if (!user?.isAnonymous) return false;
+    
+    const currentCount = parseInt(localStorage.getItem(TRIAL_CONVERSATIONS_KEY) || "0", 10);
+    return currentCount >= MAX_TRIAL_CONVERSATIONS;
+  };
+  
+  // Get remaining trial conversations
+  const getTrialConversationsRemaining = (): number => {
+    if (!user?.isAnonymous) return 0;
+    
+    const currentCount = parseInt(localStorage.getItem(TRIAL_CONVERSATIONS_KEY) || "0", 10);
+    return Math.max(0, MAX_TRIAL_CONVERSATIONS - currentCount);
+  };
+  
+  // Clear anonymous session data
+  const clearAnonymousSession = () => {
+    localStorage.removeItem(ANONYMOUS_ID_KEY);
+    localStorage.removeItem(TRIAL_CONVERSATIONS_KEY);
+  };
+
+  // Fetch user's email preferences from Firestore
+  const fetchUserEmailPreferences = async (userId: string): Promise<EmailPreferences> => {
+    try {
+      const userDocRef = doc(db, "users", userId);
+      const userDoc = await getDoc(userDocRef);
+      
+      if (userDoc.exists() && userDoc.data()?.emailPreferences) {
+        return userDoc.data().emailPreferences as EmailPreferences;
+      }
+      
+      // Create user document with default preferences if it doesn't exist
+      const userData: {
+        emailPreferences: EmailPreferences;
+        createdAt: Date;
+        email?: string | null;
+        name?: string | null;
+      } = {
+        emailPreferences: DEFAULT_EMAIL_PREFERENCES,
+        createdAt: new Date()
+      };
+      
+      if (auth.currentUser) {
+        userData.email = auth.currentUser.email;
+        userData.name = auth.currentUser.displayName;
+      }
+      
+      await setDoc(userDocRef, userData, { merge: true });
+      return DEFAULT_EMAIL_PREFERENCES;
+    } catch (error) {
+      console.error("Error fetching email preferences:", error);
+      return DEFAULT_EMAIL_PREFERENCES;
+    }
+  };
+  
+  // Update user email preferences
+  const updateEmailPreferences = async (preferences: Partial<EmailPreferences>): Promise<void> => {
+    if (!auth.currentUser) {
+      throw new Error("No authenticated user");
+    }
+    
+    try {
+      const userId = auth.currentUser.uid;
+      const userDocRef = doc(db, "users", userId);
+      
+      // Fetch current preferences
+      const userDoc = await getDoc(userDocRef);
+      const currentPreferences = userDoc.exists() && userDoc.data()?.emailPreferences
+        ? userDoc.data().emailPreferences
+        : DEFAULT_EMAIL_PREFERENCES;
+        
+      // Merge with new preferences
+      const updatedPreferences = {
+        ...currentPreferences,
+        ...preferences
+      };
+      
+      // Update in Firestore
+      await setDoc(userDocRef, {
+        emailPreferences: updatedPreferences
+      }, { merge: true });
+      
+      // Update local user state
+      setUser(prev => {
+        if (prev) {
+          return {
+            ...prev,
+            emailPreferences: updatedPreferences
+          };
+        }
+        return prev;
+      });
+    } catch (error: any) {
+      console.error("Error updating email preferences:", error);
+      throw new Error(error.message);
+    }
+  };
+  
+  // Send email notification
+  const sendEmailNotification = async (template: EmailTemplate, data?: Record<string, any>): Promise<boolean> => {
+    if (!user || !user.email) {
+      console.log("Cannot send email: No user or email");
+      return false;
+    }
+    
+    // For anonymous users, only allow trial notifications
+    if (user.isAnonymous && template !== 'trial-reminder') {
+      return false;
+    }
+    
+    try {
+      // Check user preferences for this email type
+      let shouldSend = true;
+      
+      // If user has specific preferences and is not anonymous
+      if (user.emailPreferences && !user.isAnonymous) {
+        switch (template) {
+          case 'system-update':
+            shouldSend = user.emailPreferences.systemUpdates;
+            break;
+          case 'chat-summary':
+            shouldSend = user.emailPreferences.chatSummaries;
+            break;
+          case 'trial-reminder':
+            shouldSend = user.emailPreferences.trialNotifications;
+            break;
+          // Welcome and account verification emails are always sent
+          case 'welcome':
+          case 'account-verification':
+          case 'reset-password':
+            shouldSend = true;
+            break;
+          default:
+            shouldSend = true;
+        }
+      }
+      
+      if (!shouldSend) {
+        console.log(`Email notification skipped due to user preferences: ${template}`);
+        return false;
+      }
+      
+      // Send the email using the client-side service
+      const result = await sendEmail({
+        to: user.email,
+        subject: getEmailSubject(template),
+        template,
+        data: {
+          name: user.name,
+          ...data
+        }
+      });
+      
+      return result.success;
+    } catch (error) {
+      console.error("Error sending email notification:", error);
+      return false;
+    }
+  };
+  
+  // Helper function to get email subject based on template
+  const getEmailSubject = (template: EmailTemplate): string => {
+    switch (template) {
+      case 'welcome':
+        return "Welcome to PocketLawyer";
+      case 'reset-password':
+        return "Reset Your PocketLawyer Password";
+      case 'chat-summary':
+        return "Your Chat Summary from PocketLawyer";
+      case 'system-update':
+        return "PocketLawyer System Update";
+      case 'trial-reminder':
+        return "Your PocketLawyer Trial Status";
+      case 'account-verification':
+        return "Verify Your PocketLawyer Account";
+      default:
+        return "PocketLawyer Notification";
+    }
+  };
+
+  // Handle redirect after auth state change
+  useEffect(() => {
+    if (!loading && user && !initialAuthChecked) {
+      const currentPath = window.location.pathname;
+      const authPages = ["/sign-in", "/sign-up", "/sign-in-new", "/sign-up-new"];
+      const publicPages = ["/welcome", "/terms", "/privacy", "/blog", "/contact"];
+      const isAuthPage = authPages.includes(currentPath);
+      const isPublicPage = publicPages.includes(currentPath);
+      
+      // If user just signed in/up, redirect to dashboard or onboarding
+      if (isAuthPage && !user.isAnonymous) {
+        // Check onboarding status
+        getDoc(doc(db, "users", user.id, "onboarding", "progress"))
+          .then((progressDoc) => {
+            const shouldShowOnboarding = !progressDoc.exists() || !progressDoc.data()?.finishedAt;
+            if (shouldShowOnboarding) {
+              router.push("/onboarding");
+            } else {
+              router.push("/");
+            }
+          })
+          .catch(() => {
+            // If error checking onboarding, just go to home
+            router.push("/");
+          })
+          .finally(() => setInitialAuthChecked(true));
+        return;
+      }
+      
+      // Don't redirect if on other public pages
+      if (isPublicPage) {
+        setInitialAuthChecked(true);
+        return;
+      }
+
+      // Check onboarding status for non-auth pages
+      if (!user.isAnonymous && currentPath !== "/onboarding") {
+        getDoc(doc(db, "users", user.id, "onboarding", "progress"))
+          .then((progressDoc) => {
+            const shouldShowOnboarding = !progressDoc.exists() || !progressDoc.data()?.finishedAt;
+            if (shouldShowOnboarding) {
+              router.push("/onboarding");
+            }
+          })
+          .catch(console.error)
+          .finally(() => setInitialAuthChecked(true));
+      } else {
+        setInitialAuthChecked(true);
+      }
+    }
+  }, [user, loading, router, initialAuthChecked]);
+
+  useEffect(() => {
+    // Set session persistence
+    setPersistence(auth, browserSessionPersistence);
+
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
+        try {
+          // Clear any existing anonymous session data first
+          clearAnonymousSession();
+          
+          // Get the ID token
+          const idToken = await firebaseUser.getIdToken();
+          
+          // Create a session cookie
+          const response = await fetch('/api/auth/session', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ idToken }),
+          });
+
+          if (!response.ok) {
+            throw new Error('Failed to create session');
+          }
+
+          // Now that we have a valid session, set the user state
+          const emailPreferences = await fetchUserEmailPreferences(firebaseUser.uid).catch(() => DEFAULT_EMAIL_PREFERENCES);
+          setUser({
+            id: firebaseUser.uid,
+            email: firebaseUser.email,
+            name: firebaseUser.displayName,
+            profileImage: firebaseUser.photoURL,
+            provider: firebaseUser.providerData[0]?.providerId === 'google.com' ? 'google' : 'email',
+            isAnonymous: false,
+            emailPreferences
+          });
+        } catch (error) {
+          console.error('Error setting up session:', error);
+          setUser(null);
+        }
+      } else {
+        // No authenticated user, create or use anonymous session
+        const anonymousUser = initAnonymousSession();
+        setUser(anonymousUser);
+        
+        // Clear the session cookie without waiting
+        fetch('/api/auth/session', { method: 'DELETE' }).catch(console.error);
+      }
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  const signIn = async (email: string, password: string) => {
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+      // Reset initialAuthChecked to allow redirect logic to run
+      setInitialAuthChecked(false);
+      
+      // Immediate redirect for auth pages
+      const currentPath = window.location.pathname;
+      const authPages = ["/sign-in", "/sign-up", "/sign-in-new", "/sign-up-new"];
+      if (authPages.includes(currentPath)) {
+        logger.info('Sign in successful, redirecting from auth page');
+        router.push("/");
+      } else {
+        logger.info('Sign in successful, staying on current page');
+      }
+    } catch (error: any) {
+      logger.error('Sign in failed', error);
+      throw new Error(error.message);
+    }
+  };
+
+  const signUp = async (email: string, password: string, name?: string) => {
+    if (!email.includes("@")) {
+      throw new Error("Invalid email format");
+    }
+
+    if (password.length < 6) {
+      throw new Error("Password must be at least 6 characters");
+    }
+
+    try {
+      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+      
+      // Update the user's display name if provided
+      if (name && userCredential.user) {
+        await updateFirebaseProfile(userCredential.user, {
+          displayName: name
+        });
+      }
+
+      // Get the ID token right after sign-up
+      const idToken = await userCredential.user.getIdToken();
+      
+      // Set the session cookie
+      await fetch('/api/auth/session', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ idToken }),
+      });
+      
+      // Create user document with default email preferences
+      const userDocRef = doc(db, "users", userCredential.user.uid);
+      await setDoc(userDocRef, {
+        email,
+        name: name || '',
+        createdAt: new Date(),
+        emailPreferences: DEFAULT_EMAIL_PREFERENCES
+      }, { merge: true });
+      
+      // Send welcome email
+      sendEmail({
+        to: email,
+        subject: "Welcome to PocketLawyer",
+        template: "welcome",
+        data: { name: name || 'there' }
+      }).catch(error => {
+        console.error("Error sending welcome email:", error);
+      });
+
+      // Reset initialAuthChecked to allow redirect logic to run
+      setInitialAuthChecked(false);
+      logger.info('Sign up successful, waiting for auth state change');
+      
+      // Router push will happen in useEffect after auth state changes
+    } catch (error: any) {
+      logger.error('Sign-up error', error);
+      
+      // Provide more specific error messages
+      let errorMessage = error.message;
+      
+      switch (error.code) {
+        case 'auth/email-already-in-use':
+          errorMessage = 'This email is already registered. Please sign in instead.';
+          break;
+        case 'auth/invalid-email':
+          errorMessage = 'Please enter a valid email address.';
+          break;
+        case 'auth/operation-not-allowed':
+          errorMessage = 'Email/password sign-up is not enabled. Please contact support.';
+          break;
+        case 'auth/weak-password':
+          errorMessage = 'Password is too weak. Please use at least 6 characters.';
+          break;
+        case 'auth/internal-error':
+          errorMessage = 'Authentication service error. Please check:\n1. Email/Password auth is enabled in Firebase Console\n2. API key restrictions allow authentication\n3. Your internet connection\n\nIf the problem persists, contact support.';
+          break;
+        case 'auth/network-request-failed':
+          errorMessage = 'Network error. Please check your internet connection and try again.';
+          break;
+        default:
+          errorMessage = `Sign-up failed: ${error.message}`;
+      }
+      
+      throw new Error(errorMessage);
+    }
+  };
+
+  const signInWithGoogle = async () => {
+    try {
+      const provider = new GoogleAuthProvider();
+      const result = await signInWithPopup(auth, provider);
+      
+      // Create or update user document
+      const userDocRef = doc(db, "users", result.user.uid);
+      const userDoc = await getDoc(userDocRef);
+      
+      if (!userDoc.exists()) {
+        // Create new user document if it doesn't exist
+        await setDoc(userDocRef, {
+          email: result.user.email,
+          name: result.user.displayName,
+          createdAt: new Date(),
+          emailPreferences: DEFAULT_EMAIL_PREFERENCES
+        });
+        
+        // Send welcome email for new users
+        sendEmail({
+          to: result.user.email!,
+          subject: "Welcome to PocketLawyer",
+          template: "welcome",
+          data: { name: result.user.displayName || 'there' }
+        }).catch(error => {
+          logger.error("Error sending welcome email", error);
+        });
+      }
+      
+      // Reset initialAuthChecked to allow redirect logic to run
+      setInitialAuthChecked(false);
+      
+      // Immediate redirect for auth pages
+      const currentPath = window.location.pathname;
+      const authPages = ["/sign-in", "/sign-up", "/sign-in-new", "/sign-up-new"];
+      if (authPages.includes(currentPath)) {
+        logger.info('Google sign in successful, redirecting from auth page');
+        router.push("/");
+      } else {
+        logger.info('Google sign in successful, staying on current page');
+      }
+    } catch (error: any) {
+      throw new Error(error.message);
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth);
+      router.push("/welcome");
+    } catch (error: any) {
+      throw new Error(error.message);
+    }
+  };
+
+  const resetPassword = async (email: string) => {
+    try {
+      await sendPasswordResetEmail(auth, email);
+    } catch (error: any) {
+      throw new Error(error.message);
+    }
+  };
+
+  const updateProfile = async (data: { name?: string; email?: string; photoURL?: string }) => {
+    if (!auth.currentUser) {
+      throw new Error("No authenticated user");
+    }
+
+    try {
+      // Update display name and photo URL if provided
+      if (data.name || data.photoURL) {
+        await updateFirebaseProfile(auth.currentUser, {
+          displayName: data.name || auth.currentUser.displayName,
+          photoURL: data.photoURL || auth.currentUser.photoURL,
+        });
+      }
+
+      // Update email if provided
+      if (data.email && data.email !== auth.currentUser.email) {
+        await updateFirebaseEmail(auth.currentUser, data.email);
+      }
+
+      // Update local user state
+      if (auth.currentUser) {
+        setUser({
+          id: auth.currentUser.uid,
+          email: auth.currentUser.email,
+          name: auth.currentUser.displayName,
+          profileImage: auth.currentUser.photoURL,
+          provider: auth.currentUser.providerData[0]?.providerId === 'google.com' ? 'google' : 'email'
+        });
+      }
+    } catch (error: any) {
+      throw new Error(error.message);
+    }
+  };
+
+  const updatePassword = async (currentPassword: string, newPassword: string) => {
+    if (!auth.currentUser || !auth.currentUser.email) {
+      throw new Error("No authenticated user");
+    }
+
+    try {
+      // Re-authenticate user first
+      await signInWithEmailAndPassword(auth, auth.currentUser.email, currentPassword);
+      
+      // Update password
+      await updateFirebasePassword(auth.currentUser, newPassword);
+    } catch (error: any) {
+      throw new Error(error.message);
+    }
+  };
+
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        loading,
+        signIn,
+        signUp,
+        signInWithGoogle,
+        signOut: handleSignOut,
+        resetPassword,
+        updateProfile,
+        updatePassword,
+        incrementTrialConversations,
+        isTrialLimitReached,
+        getTrialConversationsRemaining,
+        clearAnonymousSession,
+        updateEmailPreferences,
+        sendEmailNotification
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  return (
+    <Suspense fallback={<div>Loading authentication...</div>}>
+      <AuthProviderContent>{children}</AuthProviderContent>
+    </Suspense>
+  );
+}
+
+export function useAuth() {
+  const context = useContext(AuthContext)
+  if (context === undefined) {
+    throw new Error("useAuth must be used within an AuthProvider")
+  }
+  return context
+}
