@@ -9,8 +9,18 @@ import crypto from 'crypto';
 import { adminDb } from './firebase-admin';
 import { Timestamp } from 'firebase-admin/firestore';
 
-// Initialize Postmark client
-const client = new ServerClient(process.env.POSTMARK_SERVER_TOKEN || '');
+// Lazy-initialize Postmark client (avoid build-time token validation)
+let _client: ServerClient | null = null;
+function getPostmarkClient(): ServerClient {
+  if (!_client) {
+    const token = process.env.POSTMARK_SERVER_TOKEN;
+    if (!token) {
+      throw new Error('POSTMARK_SERVER_TOKEN environment variable is not set');
+    }
+    _client = new ServerClient(token);
+  }
+  return _client;
+}
 
 // Email template types
 export type EmailTemplate = 
@@ -228,7 +238,7 @@ export async function sendEmail({
 
     // Send email via Postmark
     logger.info(`Sending email via Postmark to ${Array.isArray(to) ? to.join(', ') : to}`);
-    const response = await client.sendEmail(messageData);
+    const response = await getPostmarkClient().sendEmail(messageData);
 
     return { 
       success: true, 
